@@ -1,3 +1,4 @@
+import os
 import time
 from io import BytesIO
 
@@ -13,6 +14,67 @@ st.set_page_config(
 )
 
 st.title("评论AI分析工具")
+
+# 模板文件下载功能
+template_file_path = os.path.join(os.path.dirname(__file__), "template.xlsx")
+if os.path.exists(template_file_path):
+    with open(template_file_path, "rb") as f:
+        template_data = f.read()
+    st.download_button(
+        label="📥 下载Excel模板",
+        data=template_data,
+        file_name="评论分析模板.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+else:
+    st.warning("未找到模板文件，请联系管理员")
+
+st.markdown("---")
+
+# 模板使用说明
+with st.expander("📖 模板使用说明与AI分析逻辑", expanded=True):
+    st.markdown("""
+### 1. 这个工具怎么运作
+
+用户下载模板 → 填写各个 Sheet → 上传 Excel → 输入 API Key → 设置每批分析数量 → AI 读取模板里的产品信息、分类层级、示例案例 → 逐条分析评论 → 输出分类结果和分析结果。
+
+### 2. 各 Sheet 页作用
+
+**评论数据**
+- 用户放真正需要分析的评论数据
+- 核心字段是评论内容
+- 建议保留原行号、订单号、SKU、评分、评论时间等字段，用于后续结果回填和定位来源
+
+**层级表**
+- 用于定义 AI 的分类体系
+- 例如一级分类、二级分类、三级分类
+- AI 会优先按照这里的分类框架判断评论属于哪个问题类型，避免每次自由发挥，保证分类口径统一
+
+**产品介绍**
+- 用于告诉 AI 这个产品是什么
+- 包括产品名称、功能、使用场景、适用人群、材质、尺寸、卖点、配件等
+- 目的是让 AI 结合产品背景理解评论，不要脱离产品乱判断
+
+**案例/修正/引导**
+- 用于放人工示例
+- 例如某条评论应该怎么分类、为什么这么分、哪些分法是错误的、应该如何修正
+- 这相当于给 AI 做 few-shot 引导，提高准确率和一致性
+
+### 3. 为什么要填这些
+
+- 层级表 → 负责"分类标准"
+- 产品介绍 → 负责"产品背景"
+- 案例 → 负责"判断示范"
+- 评论数据 → 负责"待分析内容"
+
+AI 不是只看评论本身，而是综合这些 Sheet 后再判断。
+
+### 4. 使用建议
+
+- 第一次使用建议先放 20-50 条评论测试
+- 确认分类口径正确后，再上传几千或几万条评论
+- 如果分类不准，优先调整层级表和案例 Sheet
+    """)
 
 uploaded_file = st.file_uploader("上传Excel文件", type=["xlsx"])
 api_key = st.text_input("请输入API Key", type="password")
