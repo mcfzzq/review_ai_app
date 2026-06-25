@@ -1,11 +1,25 @@
 import os
+import sys
 import time
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 from utils.ai_client import table_to_text, analyze_one_comment
+from utils.charts import (
+    build_sunburst_chart,
+    build_monthly_trend_chart,
+    build_sku_heatmap,
+    build_sku_bubble_chart,
+    build_sku_compare_chart,
+    build_pareto_chart,
+    build_wordcloud_figure,
+    build_sku_issue_table,
+)
+from utils.statistics import summarize_review_status, is_valid_comment
 
 
 st.set_page_config(
@@ -15,11 +29,11 @@ st.set_page_config(
 
 st.title("评论AI分析工具")
 
-# 模板文件下载功能
 template_file_path = os.path.join(os.path.dirname(__file__), "template.xlsx")
 if os.path.exists(template_file_path):
     with open(template_file_path, "rb") as f:
         template_data = f.read()
+
     st.download_button(
         label="📥 下载Excel模板",
         data=template_data,
@@ -31,8 +45,7 @@ else:
 
 st.markdown("---")
 
-# 模板使用说明
-with st.expander("📖 模板使用说明与AI分析逻辑", expanded=True):
+with st.expander("📖 模板使用说明与AI分析逻辑", expanded=False):
     st.markdown("""
 ### 1. 这个工具怎么运作
 
@@ -40,55 +53,39 @@ with st.expander("📖 模板使用说明与AI分析逻辑", expanded=True):
 
 ### 2. 各 Sheet 页作用
 
-**评论数据**
-- 用户放真正需要分析的评论数据
-- 核心字段是评论内容
-- 建议保留原行号、订单号、SKU、评分、评论时间等字段，用于后续结果回填和定位来源
+**评论**
+- 放真正需要分析的评论数据。
+- 核心字段是【买家备注】。
+- 建议保留订单号、SKU、退货时间等字段，用于后续结果回填和定位来源。
+
+**销量**
+- 用于结合 SKU 与月份计算问题率。
+- 需要字段：【亚马逊SKU】、【月份】、【销量】。
 
 **层级表**
-- 用于定义 AI 的分类体系
-- 例如一级分类、二级分类、三级分类
-- AI 会优先按照这里的分类框架判断评论属于哪个问题类型，避免每次自由发挥，保证分类口径统一
+- 用于定义 AI 的分类体系。
+- AI 会优先按照这里的分类框架判断评论属于哪个问题类型。
 
-**产品介绍**
-- 用于告诉 AI 这个产品是什么
-- 包括产品名称、功能、使用场景、适用人群、材质、尺寸、卖点、配件等
-- 目的是让 AI 结合产品背景理解评论，不要脱离产品乱判断
+**产品描述**
+- 用于告诉 AI 这个产品是什么。
 
-**案例/修正/引导**
-- 用于放人工示例
-- 例如某条评论应该怎么分类、为什么这么分、哪些分法是错误的、应该如何修正
-- 这相当于给 AI 做 few-shot 引导，提高准确率和一致性
-
-### 3. 为什么要填这些
-
-- 层级表 → 负责"分类标准"
-- 产品介绍 → 负责"产品背景"
-- 案例 → 负责"判断示范"
-- 评论数据 → 负责"待分析内容"
-
-AI 不是只看评论本身，而是综合这些 Sheet 后再判断。
-
-### 4. 使用建议
-
-- 第一次使用建议先放 20-50 条评论测试
-- 确认分类口径正确后，再上传几千或几万条评论
-- 如果分类不准，优先调整层级表和案例 Sheet
+**分类案例**
+- 用于放人工示例，提高准确率和一致性。
     """)
 
 uploaded_file = st.file_uploader("上传Excel文件", type=["xlsx"])
-api_key = st.text_input("请输入API Key", type="password")
+api_key = st.text_input("请输入API密钥", type="password")
 batch_size = st.slider("每批发送给AI的评论数量", 1, 50, 5)
 
-required_sheets = ["评论", "层级表", "产品描述", "分类举例"]
+required_sheets = ["评论", "销量", "产品描述", "层级表", "分类案例"]
 
 can_analyze = True
 
 df_comment = None
+df_sales = None
 df_level = None
 df_product = None
 df_examples = None
-
 
 if uploaded_file is None:
     st.warning("请先上传Excel文件")
@@ -106,12 +103,16 @@ else:
         can_analyze = False
     else:
         df_comment = pd.read_excel(uploaded_file, sheet_name="评论")
+        df_sales = pd.read_excel(uploaded_file, sheet_name="销量")
         df_level = pd.read_excel(uploaded_file, sheet_name="层级表")
         df_product = pd.read_excel(uploaded_file, sheet_name="产品描述")
-        df_examples = pd.read_excel(uploaded_file, sheet_name="分类举例")
+        df_examples = pd.read_excel(uploaded_file, sheet_name="分类案例")
 
         if "买家备注" not in df_comment.columns:
             st.error("评论sheet中未找到【买家备注】列")
+            can_analyze = False
+        elif "一级场景" not in df_comment.columns:
+            st.error("评论sheet中未找到【一级场景】列")
             can_analyze = False
         elif "订单号" not in df_comment.columns:
             st.error("评论sheet中未找到【订单号】列")
@@ -119,27 +120,55 @@ else:
         else:
             st.success("文件结构校验通过")
 
-            tab1, tab2, tab3, tab4 = st.tabs(["评论", "层级表", "产品描述", "分类举例"])
+            try:
+                review_status = summarize_review_status(df_comment)
+            except KeyError as e:
+                st.error(str(e))
+                can_analyze = False
+            else:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("评论总数", review_status["total_comments"])
+                col2.metric("已分析", review_status["analyzed_comments"])
+                col3.metric("待分析", review_status["pending_comments"])
+                col4.metric("空评论行", review_status["empty_comment_rows"])
 
-            with tab1:
-                st.write(f"评论数据：{len(df_comment)} 行，{len(df_comment.columns)} 列")
-                st.dataframe(df_comment.head(20), use_container_width=True)
+                if review_status["pending_comments"] == 0:
+                    st.info("当前没有新增待分析评论。点击开始分析后，将直接基于完整历史结果生成结果文件和数据分析图表。")
+                else:
+                    st.warning(
+                        f"本次将只分析 {review_status['pending_comments']} 条新增评论，"
+                        f"已分析历史评论不会重复调用 AI。"
+                    )
 
-            with tab2:
-                st.write(f"层级表：{len(df_level)} 行，{len(df_level.columns)} 列")
-                st.dataframe(df_level, use_container_width=True)
+                st.caption("空评论行指买家备注为空、NA、N/A、None、null、- 等无有效评论内容的行，不会调用 AI。")
 
-            with tab3:
-                st.write(f"产品描述：{len(df_product)} 行，{len(df_product.columns)} 列")
-                st.dataframe(df_product, use_container_width=True)
+            if can_analyze:
+                tab1, tab2, tab3, tab4, tab5 = st.tabs(
+                    ["评论", "销量", "分类表", "产品描述", "分类案例"]
+                )
 
-            with tab4:
-                st.write(f"分类举例：{len(df_examples)} 行，{len(df_examples.columns)} 列")
-                st.dataframe(df_examples.head(20), use_container_width=True)
+                with tab1:
+                    st.write(f"评论数据：{len(df_comment)} 行，{len(df_comment.columns)} 列")
+                    st.dataframe(df_comment.head(20), use_container_width=True)
 
+                with tab2:
+                    st.write(f"销量数据：{len(df_sales)} 行，{len(df_sales.columns)} 列")
+                    st.dataframe(df_sales.head(20), use_container_width=True)
+
+                with tab3:
+                    st.write(f"分类层级数据：{len(df_level)} 行，{len(df_level.columns)} 列")
+                    st.dataframe(df_level, use_container_width=True)
+
+                with tab4:
+                    st.write(f"产品描述：{len(df_product)} 行，{len(df_product.columns)} 列")
+                    st.dataframe(df_product, use_container_width=True)
+
+                with tab5:
+                    st.write(f"分类案例：{len(df_examples)} 行，{len(df_examples.columns)} 列")
+                    st.dataframe(df_examples.head(20), use_container_width=True)
 
 if not api_key:
-    st.warning("请填写API Key")
+    st.warning("请填写API密钥")
     can_analyze = False
 
 
@@ -153,91 +182,83 @@ if st.button("开始分析", disabled=not can_analyze):
     df_comment = df_comment.copy()
     df_comment["订单号"] = df_comment["订单号"].fillna("").astype(str).str.strip()
     df_comment["买家备注"] = df_comment["买家备注"].fillna("").astype(str).str.strip()
+    df_comment["一级场景"] = df_comment["一级场景"].fillna("").astype(str).str.strip()
 
-    valid_df = df_comment[
-        (df_comment["买家备注"] != "")
-        & (df_comment["买家备注"].str.lower() != "nan")
-        & (df_comment["买家备注"].str.lower() != "na")
-        & (df_comment["买家备注"].str.lower() != "n/a")
+    for col in ["二级维度", "三级对象", "四级问题", "五级描述", "AI原始返回"]:
+        if col not in df_comment.columns:
+            df_comment[col] = ""
+
+    pending_df = df_comment[
+        df_comment["一级场景"].eq("")
+        & df_comment["买家备注"].apply(is_valid_comment)
     ].copy()
 
-    st.write(f"总行数：{len(df_comment)}")
-    st.write(f"有效评论数：{len(valid_df)}")
+    completed_count = len(df_comment) - len(pending_df)
+
+    st.write(f"总评论行数：{len(df_comment)}")
+    st.write(f"已完成分析行数：{completed_count}")
+    st.write(f"本次新增分析行数：{len(pending_df)}")
     st.write(f"每批发送数量：{batch_size}")
 
-    rows = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    total = len(pending_df)
 
-    total = len(valid_df)
+    if total == 0:
+        st.info("没有需要新增分析的评论行，当前评论数据已是完整结果。")
+    else:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-    for idx, (_, row) in enumerate(valid_df.iterrows(), start=1):
-        order_id = str(row["订单号"]).strip()
-        comment = str(row["买家备注"]).strip()
+        for idx, (row_index, row) in enumerate(pending_df.iterrows(), start=1):
+            order_id = str(row["订单号"]).strip()
+            comment = str(row["买家备注"]).strip()
 
-        status_text.write(f"正在分析第 {idx} / {total} 条，订单号：{order_id}")
+            status_text.write(f"正在分析第 {idx} / {total} 条，订单号：{order_id}")
 
-        try:
-            data, raw_text = analyze_one_comment(
-                api_key=api_key,
-                comment=comment,
-                product_text=product_text,
-                level_text=level_text,
-                examples_text=examples_text
-            )
+            try:
+                data, raw_text = analyze_one_comment(
+                    api_key=api_key,
+                    comment=comment,
+                    product_text=product_text,
+                    level_text=level_text,
+                    examples_text=examples_text
+                )
 
-            for item in data:
-                rows.append({
-                    "订单号": order_id,
-                    "买家备注": comment,
-                    "一级场景": item.get("一级场景", ""),
-                    "二级维度": item.get("二级维度", ""),
-                    "三级对象": item.get("三级对象", ""),
-                    "四级问题": item.get("四级问题", ""),
-                    "五级描述": item.get("五级描述", ""),
-                    "AI原始返回": raw_text
-                })
+                if isinstance(data, list) and len(data) > 0:
+                    item = data[0]
+                elif isinstance(data, dict):
+                    item = data
+                else:
+                    item = {}
 
-        except Exception as e:
-            rows.append({
-                "订单号": order_id,
-                "买家备注": comment,
-                "一级场景": "报错",
-                "二级维度": "",
-                "三级对象": "",
-                "四级问题": "",
-                "五级描述": "",
-                "AI原始返回": str(e)
-            })
+                df_comment.loc[row_index, "一级场景"] = item.get("一级场景", "")
+                df_comment.loc[row_index, "二级维度"] = item.get("二级维度", "")
+                df_comment.loc[row_index, "三级对象"] = item.get("三级对象", "")
+                df_comment.loc[row_index, "四级问题"] = item.get("四级问题", "")
+                df_comment.loc[row_index, "五级描述"] = item.get("五级描述", "")
+                df_comment.loc[row_index, "AI原始返回"] = raw_text
 
-        progress_bar.progress(idx / total)
-        time.sleep(0.5)
+            except Exception as e:
+                df_comment.loc[row_index, "一级场景"] = "报错"
+                df_comment.loc[row_index, "二级维度"] = ""
+                df_comment.loc[row_index, "三级对象"] = ""
+                df_comment.loc[row_index, "四级问题"] = ""
+                df_comment.loc[row_index, "五级描述"] = ""
+                df_comment.loc[row_index, "AI原始返回"] = str(e)
 
-    result_df = pd.DataFrame(rows)
+            progress_bar.progress(idx / total)
+            time.sleep(0.5)
 
-    st.subheader("AI分析结果")
-    st.dataframe(result_df, use_container_width=True)
-
-    output_comment_df = result_df[
-        [
-            "订单号",
-            "买家备注",
-            "一级场景",
-            "二级维度",
-            "三级对象",
-            "四级问题",
-            "五级描述"
-        ]
-    ]
+    st.subheader("完整评论结果")
+    st.dataframe(df_comment.head(20), use_container_width=True)
 
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        output_comment_df.to_excel(writer, sheet_name="评论", index=False)
+        df_comment.to_excel(writer, sheet_name="评论", index=False)
+        df_sales.to_excel(writer, sheet_name="销量", index=False)
         df_level.to_excel(writer, sheet_name="层级表", index=False)
         df_product.to_excel(writer, sheet_name="产品描述", index=False)
-        df_examples.to_excel(writer, sheet_name="分类举例", index=False)
-        result_df.to_excel(writer, sheet_name="AI原始结果", index=False)
+        df_examples.to_excel(writer, sheet_name="分类案例", index=False)
 
     output.seek(0)
 
@@ -247,3 +268,70 @@ if st.button("开始分析", disabled=not can_analyze):
         file_name="AI分析结果.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    st.markdown("---")
+    st.header("数据分析")
+
+    try:
+        analyzed_df = df_comment.copy()
+        analyzed_df = analyzed_df[analyzed_df["一级场景"].apply(is_valid_comment)]
+
+        if analyzed_df.empty:
+            st.info("当前暂无已分析的评论数据，无法生成数据分析图表。")
+        else:
+            st.caption("说明：旭日图、帕累托图展示问题结构和问题数量；趋势图、热力图、气泡图、SKU对比图展示问题率。")
+
+            st.subheader("1. 问题分类结构旭日图")
+            try:
+                st.plotly_chart(build_sunburst_chart(analyzed_df), use_container_width=True)
+            except Exception as e:
+                st.info(f"旭日图暂不可用：{e}")
+
+            st.subheader("2. 四级问题月度问题率趋势")
+            try:
+                st.plotly_chart(build_monthly_trend_chart(analyzed_df, df_sales), use_container_width=True)
+            except Exception as e:
+                st.info(f"月度问题率趋势图暂不可用：{e}")
+
+            st.subheader("3. SKU × 问题层级问题率热力图")
+            try:
+                st.plotly_chart(build_sku_heatmap(analyzed_df, df_sales), use_container_width=True)
+            except Exception as e:
+                st.info(f"SKU问题率热力图暂不可用：{e}")
+
+            st.subheader("4. SKU销量 × 问题率气泡图")
+            try:
+                st.plotly_chart(build_sku_bubble_chart(analyzed_df, df_sales), use_container_width=True)
+            except Exception as e:
+                st.info(f"SKU气泡图暂不可用：{e}")
+
+            st.subheader("5. SKU主要问题率对比")
+            try:
+                st.plotly_chart(build_sku_compare_chart(analyzed_df, df_sales), use_container_width=True)
+            except Exception as e:
+                st.info(f"SKU问题率对比图暂不可用：{e}")
+
+            st.subheader("6. 四级问题帕累托分析")
+            try:
+                st.plotly_chart(build_pareto_chart(analyzed_df), use_container_width=True)
+            except Exception as e:
+                st.info(f"帕累托图暂不可用：{e}")
+
+            st.subheader("7. 评论词云")
+            try:
+                wordcloud_fig = build_wordcloud_figure(analyzed_df)
+                st.pyplot(wordcloud_fig, use_container_width=True)
+            except Exception as e:
+                st.info(f"词云暂不可用：{e}")
+
+            st.subheader("8. SKU主要问题明细表")
+            try:
+                sku_table = build_sku_issue_table(analyzed_df, df_sales, top_n=5)
+                st.dataframe(sku_table, use_container_width=True)
+            except Exception as e:
+                st.info(f"SKU主要问题明细表暂不可用：{e}")
+
+    except KeyError as e:
+        st.error(str(e))
+    except Exception as e:
+        st.error(f"生成数据分析图表时出错：{e}")
